@@ -108,7 +108,7 @@ aws logs filter-log-events --log-group-name "$LOG_GROUP" --filter-pattern "\"$(a
 
 ## The `fetch_blocked_page` tool
 
-Input: `url` (required), `include_frontmatter` (default `true`), `max_tokens` (500–100000, default 20000).
+Input: `url` (required), `max_chars` (2000–400000, default 80000).
 
 Pipeline:
 
@@ -116,9 +116,9 @@ Pipeline:
 2. **Unlocker** (`src/fetch/unlocker.ts`) with `format: "raw"` and `data_format: "markdown"`: the body is Bright Data's Markdown of the whole page (navigation included, relative links left as they are), with the site's headers, and the site's status in `x-brd-status-code`. A response without that header is Bright Data's own error, reported as `UNLOCKER_ERROR` with Bright Data's reason. One retry on network or 5xx errors, 15 MB cap.
 3. **HTTP errors.** Any 4xx/5xx from the site, a block Bright Data couldn't get past included, is `HTTP_ERROR`. There is no other block or JavaScript-shell detection: unblocking, and deciding when a page needs a browser to render, is what Bright Data is paid for.
 4. **Content type.** The site's `Content-Type` must be text (HTML, `text/*`, JSON, XML). A PDF is `UNSUPPORTED_CONTENT_TYPE` with a pointer to the built-in web fetch, which reads PDFs natively; Bright Data's Markdown mode returns a PDF's raw bytes. Other binary types are refused the same way.
-5. **Truncate** to about `max_tokens` (4 characters per token), at a paragraph boundary.
+5. **Truncate** to `max_chars` characters, at a paragraph or line boundary if that keeps at least half of them.
 
-Output is Markdown with YAML front matter (`url`, `status_code`, `truncated`, `approx_tokens`). Errors are tool results with `isError: true` and one line, `ERROR <CODE>: <reason and what to do>`. The codes are `INVALID_URL`, `SSRF_BLOCKED`, `DOMAIN_BLOCKED`, `SUSPICIOUS_QUERY`, `TIMEOUT`, `UNLOCKER_ERROR`, `UNSUPPORTED_CONTENT_TYPE`, `TOO_LARGE` and `HTTP_ERROR`.
+Output is Bright Data's Markdown as-is. A page cut by `max_chars` ends with `[... truncated: showing <n> of <total> characters]`. There is no front matter: Bright Data adds none, the model already knows the URL, and a returned page always has a 2xx status. Errors are tool results with `isError: true` and one line, `ERROR <CODE>: <reason and what to do>`. The codes are `INVALID_URL`, `SSRF_BLOCKED`, `DOMAIN_BLOCKED`, `SUSPICIOUS_QUERY`, `TIMEOUT`, `UNLOCKER_ERROR`, `UNSUPPORTED_CONTENT_TYPE`, `TOO_LARGE` and `HTTP_ERROR`.
 
 ## Tests
 

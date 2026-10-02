@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ParameterNotFoundError } from "@aws-lambda-powertools/parameters/errors";
 import { z } from "zod";
 import { FetchError } from "../fetch/errors.js";
-import { approxTokens, frontMatter, truncate } from "../fetch/output.js";
+import { truncate } from "../fetch/output.js";
 import { checkUrl, DEFAULT_BLOCKED_DOMAINS } from "../fetch/safety.js";
 import { fetchUnlocker } from "../fetch/unlocker.js";
 import { getSecret } from "../utils/aws.js";
@@ -14,7 +14,7 @@ const DESCRIPTION = `Fetch a public web page through a paid unblocking service. 
 
 Only fetch URLs the user gave you or that appeared in a previous tool result. Don't construct or modify URLs (e.g. adding query parameters); such requests may be rejected.
 
-Returns the whole page as Markdown, navigation included, with a YAML front matter block (URL, status, truncation). Doesn't handle PDFs or other binary files; the built-in web fetch reads PDFs directly. Cannot log in, click or submit forms.`;
+Returns the whole page as Markdown, navigation included; a page longer than max_chars is cut and ends with a note saying so. Doesn't handle PDFs or other binary files; the built-in web fetch reads PDFs directly. Cannot log in, click or submit forms.`;
 
 // Leaves headroom inside the 90 s Lambda timeout.
 const BUDGET_MS = 85_000;
@@ -24,8 +24,7 @@ const TEXT_TYPE = /^(text\/|application\/([\w.+-]+\+)?(json|xml)$|$)/;
 
 export interface FetchPageArgs {
   url: string;
-  include_frontmatter: boolean;
-  max_tokens: number;
+  max_chars: number;
 }
 
 export function blockedDomains(): string[] {
@@ -49,18 +48,14 @@ export function registerFetchPage(server: McpServer) {
           .describe(
             "Absolute http(s) URL. Must come from the user or a previous tool result.",
           ),
-        include_frontmatter: z
-          .boolean()
-          .default(true)
-          .describe("Prepend YAML metadata (URL, status, truncation)."),
-        max_tokens: z
+        max_chars: z
           .number()
           .int()
-          .min(500)
-          .max(100000)
-          .default(20000)
+          .min(2000)
+          .max(400000)
+          .default(80000)
           .describe(
-            "Approximate max size of returned text; longer content is truncated and flagged.",
+            "Max characters of Markdown to return; longer pages are cut at a paragraph boundary and flagged.",
           ),
       },
       annotations: {
@@ -115,19 +110,9 @@ export async function fetchPage(args: FetchPageArgs): Promise<string> {
     );
   }
 
-  const { text, truncated } = truncate(fetched.markdown, args.max_tokens);
-  const tokens = approxTokens(text);
-
-  if (!args.include_frontmatter)
-    return truncated ? `${text}\n\n[... truncated at ~${tokens} tokens]` : text;
-  return (
-    frontMatter({
-      url: url.href,
-      status_code: fetched.status,
-      truncated,
-      approx_tokens: tokens,
-    }) + text
-  );
+  const { text, truncated } = truncate(fetched.markdown, args.max_chars);
+  if (!truncated) return text;
+  return `${text}\n\n[... truncated: showing ${text.length} of ${fetched.markdown.length} characters]`;
 }
 
 async function brightDataConfig(): Promise<{ apiKey: string; zone: string }> {

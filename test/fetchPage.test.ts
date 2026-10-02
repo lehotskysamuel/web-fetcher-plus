@@ -49,8 +49,7 @@ const page = (
 const run = (args: Partial<FetchPageArgs> = {}) =>
   fetchPage({
     url: URL_,
-    include_frontmatter: true,
-    max_tokens: 20000,
+    max_chars: 80000,
     ...args,
   });
 
@@ -63,15 +62,9 @@ beforeEach(() => {
 });
 
 describe("fetch_blocked_page", () => {
-  it("returns front matter and Bright Data's Markdown as-is", async () => {
+  it("returns Bright Data's Markdown as-is", async () => {
     unlocker.mockResolvedValue(page(ARTICLE));
-    const out = await run();
-
-    expect(out).toBe(
-      "---\nurl: https://kitchen.example/guides/sourdough\nstatus_code: 200\ntruncated: false\n" +
-        `approx_tokens: ${Math.ceil(ARTICLE.length / 4)}\n---\n` +
-        ARTICLE,
-    );
+    expect(await run()).toBe(ARTICLE);
     expect(unlocker).toHaveBeenCalledOnce();
     expect(unlocker.mock.calls[0]![0].href).toBe(URL_);
     expect(unlocker.mock.calls[0]![1]).toMatchObject({
@@ -80,32 +73,24 @@ describe("fetch_blocked_page", () => {
     });
   });
 
-  it("omits front matter when asked", async () => {
-    unlocker.mockResolvedValue(page(ARTICLE));
-    expect(await run({ include_frontmatter: false })).toBe(ARTICLE);
-  });
-
-  it("truncates and flags it, in both output modes", async () => {
+  it("cuts long pages to max_chars and says how much is missing", async () => {
     const long = ARTICLE + "\n\nMore notes on baking and timing.".repeat(100);
     unlocker.mockResolvedValue(page(long));
-    const withMeta = await run({ max_tokens: 500 });
-    expect(withMeta).toContain("truncated: true\n");
-    const body = withMeta.split("---\n")[2]!;
-    expect(body.length).toBeLessThanOrEqual(2000);
-
-    const bare = await run({ max_tokens: 500, include_frontmatter: false });
-    expect(bare).toMatch(/\n\n\[\.\.\. truncated at ~\d+ tokens\]$/);
+    const out = await run({ max_chars: 2000 });
+    const [body, note] = out.split("\n\n[... truncated: ");
+    expect(body!.length).toBeLessThanOrEqual(2000);
+    expect(note).toBe(`showing ${body!.length} of ${long.length} characters]`);
   });
 
   it("returns JSON as-is", async () => {
     unlocker.mockResolvedValue(page('{"a": 1}', 200, "application/json"));
-    expect(await run({ include_frontmatter: false })).toBe('{"a": 1}');
+    expect(await run()).toBe('{"a": 1}');
     expect(unlocker).toHaveBeenCalledOnce();
   });
 
   it("returns a challenge page as-is; Bright Data decides what is blocked", async () => {
     unlocker.mockResolvedValue(page(CHALLENGE));
-    expect(await run({ include_frontmatter: false })).toBe(CHALLENGE);
+    expect(await run()).toBe(CHALLENGE);
   });
 
   it("explains when Bright Data isn't configured, without a request", async () => {
@@ -168,13 +153,13 @@ describe("truncate", () => {
     const text = ["a".repeat(1500), "b".repeat(1500), "c".repeat(1500)].join(
       "\n\n",
     );
-    const { text: out, truncated } = truncate(text, 1000); // 4000 chars
+    const { text: out, truncated } = truncate(text, 4000);
     expect(truncated).toBe(true);
     expect(out).toBe(["a".repeat(1500), "b".repeat(1500)].join("\n\n"));
   });
 
   it("hard-cuts when there is no boundary in the second half", () => {
-    const { text: out } = truncate("x".repeat(5000), 500);
+    const { text: out } = truncate("x".repeat(5000), 2000);
     expect(out.length).toBe(2000);
   });
 
