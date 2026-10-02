@@ -1,0 +1,7 @@
+.idea
+.venv
+tasks
+
+# sst
+.sst
+node_modules

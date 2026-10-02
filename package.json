@@ -1,0 +1,23 @@
+{
+  "name": "aikiddo-mcp",
+  "version": "1.0.0",
+  "scripts": {
+    "typecheck": "tsc",
+    "deploy": "sst deploy --stage prod",
+    "remove": "sst remove"
+  },
+  "license": "MIT",
+  "description": "Remote MCP server (claude.ai custom connector) on AWS Lambda, deployed with SST",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "sst": "4.17.1",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "8.10.164",
+    "@types/node": "^24.19.1",
+    "typescript": "^7.0.2"
+  },
+  "private": true,
+  "type": "module"
+}
