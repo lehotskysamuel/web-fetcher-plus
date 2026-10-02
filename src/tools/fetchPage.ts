@@ -1,32 +1,31 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { ParameterNotFoundError } from "@aws-lambda-powertools/parameters/errors";
 import { z } from "zod";
-import { convert, decode, kindOf } from "../fetch/convert.js";
-import { detect, detectBlock } from "../fetch/detect.js";
 import { FetchError } from "../fetch/errors.js";
-import { DirectNetworkBlock, fetchDirect, type Fetched } from "../fetch/http.js";
 import { approxTokens, frontMatter, truncate } from "../fetch/output.js";
 import { checkUrl, DEFAULT_BLOCKED_DOMAINS } from "../fetch/safety.js";
 import { fetchUnlocker } from "../fetch/unlocker.js";
 import { getSecret } from "../utils/aws.js";
 
-const BRIGHTDATA_API_KEY_NAME = "brightdata-api-key";
-const BRIGHTDATA_ZONE_NAME = "brightdata-zone";
+export const BRIGHTDATA_API_KEY_NAME = "brightdata-api-key";
+export const BRIGHTDATA_ZONE_NAME = "brightdata-zone";
 
-const DESCRIPTION = `Fetch a public web page. Use when the built-in web fetch fails, returns a CAPTCHA/access-denied page, or an empty JavaScript shell. Tries a direct request first and escalates to a paid unblocking service only when needed, so don't refetch the same URL without reason.
+const DESCRIPTION = `Fetch a public web page through a paid unblocking service. A fallback: use it only after the built-in web fetch failed on this URL, e.g. it returned a CAPTCHA/access-denied page, an error such as 403, or an empty JavaScript shell. Never use it as the first attempt. Every call costs money, so don't refetch the same URL without reason.
 
 Only fetch URLs the user gave you or that appeared in a previous tool result. Don't construct or modify URLs (e.g. adding query parameters); such requests may be rejected.
 
-Returns the page's main content as Markdown with a YAML front matter block (final URL, title, fetch path, truncation). Cannot log in, click or submit forms.`;
+Returns the whole page as Markdown, navigation included, with a YAML front matter block (URL, status, truncation). Doesn't handle PDFs or other binary files; the built-in web fetch reads PDFs directly. Cannot log in, click or submit forms.`;
 
 // Leaves headroom inside the 90 s Lambda timeout.
 const BUDGET_MS = 85_000;
 
+// Bright Data's Markdown conversion only works on text; for a PDF it returns the raw bytes.
+const TEXT_TYPE = /^(text\/|application\/([\w.+-]+\+)?(json|xml)$|$)/;
+
 export interface FetchPageArgs {
   url: string;
   include_frontmatter: boolean;
-  extract_main_content: boolean;
   max_tokens: number;
-  force_unlocker: boolean;
 }
 
 export function blockedDomains(): string[] {
@@ -40,42 +39,53 @@ export function blockedDomains(): string[] {
 
 export function registerFetchPage(server: McpServer) {
   server.registerTool(
-    "fetch_page",
+    "fetch_blocked_page",
     {
-      title: "Fetch page",
+      title: "Fetch blocked page (web fetch fallback)",
       description: DESCRIPTION,
       inputSchema: {
-        url: z.string().describe("Absolute http(s) URL. Must come from the user or a previous tool result."),
+        url: z
+          .string()
+          .describe(
+            "Absolute http(s) URL. Must come from the user or a previous tool result.",
+          ),
         include_frontmatter: z
           .boolean()
           .default(true)
-          .describe("Prepend YAML metadata (final URL, title, fetch path, status, truncation)."),
-        extract_main_content: z
-          .boolean()
-          .default(true)
-          .describe("Strip navigation, footers and boilerplate. Set false if you need nav/footer content."),
+          .describe("Prepend YAML metadata (URL, status, truncation)."),
         max_tokens: z
           .number()
           .int()
           .min(500)
           .max(100000)
           .default(20000)
-          .describe("Approximate max size of returned text; longer content is truncated and flagged."),
-        force_unlocker: z
-          .boolean()
-          .default(false)
-          .describe("Skip the direct request. Use only if you already know the site blocks bots. Costs money every call."),
+          .describe(
+            "Approximate max size of returned text; longer content is truncated and flagged.",
+          ),
       },
-      annotations: { title: "Fetch page", readOnlyHint: true, openWorldHint: true },
+      annotations: {
+        title: "Fetch blocked page (web fetch fallback)",
+        readOnlyHint: true,
+        openWorldHint: true,
+      },
     },
     async (args) => {
       try {
         return { content: [{ type: "text", text: await fetchPage(args) }] };
       } catch (err) {
-        if (!(err instanceof FetchError)) console.error("fetch_page failed", err);
+        if (!(err instanceof FetchError))
+          console.error("fetch_blocked_page failed", err);
         const error =
-          err instanceof FetchError ? err : new FetchError("HTTP_ERROR", "Unexpected failure while processing the page. Try again later.");
-        return { isError: true, content: [{ type: "text", text: error.toString() }] };
+          err instanceof FetchError
+            ? err
+            : new FetchError(
+                "HTTP_ERROR",
+                "Unexpected failure while processing the page. Try again later.",
+              );
+        return {
+          isError: true,
+          content: [{ type: "text", text: error.toString() }],
+        };
       }
     },
   );
@@ -83,80 +93,63 @@ export function registerFetchPage(server: McpServer) {
 
 export async function fetchPage(args: FetchPageArgs): Promise<string> {
   const deadline = Date.now() + BUDGET_MS;
-  const domains = blockedDomains();
-  const url = checkUrl(args.url, domains);
+  const url = checkUrl(args.url, blockedDomains());
+  // Skips the paid request in the obvious case; a PDF without the extension is caught by its Content-Type below.
+  if (/\.pdf$/i.test(url.pathname)) throw pdfError();
+  const { apiKey, zone } = await brightDataConfig();
 
-  let fetched: Fetched | undefined;
-  let escalation: string | undefined;
-  if (args.force_unlocker) {
-    escalation = "forced";
-  } else {
-    try {
-      fetched = await fetchDirect(url, domains);
-      escalation = escalationReason(fetched);
-    } catch (err) {
-      if (!(err instanceof DirectNetworkBlock)) throw err;
-      escalation = `blocked:${err.reason}`;
-    }
-  }
-
-  if (escalation) {
-    // Optional: unset until Bright Data is configured, and only escalations need them.
-    const [apiKey, zone] = await Promise.all([getSecret(BRIGHTDATA_API_KEY_NAME), getSecret(BRIGHTDATA_ZONE_NAME)]);
-    if (!apiKey || !zone) {
-      throw new FetchError(
-        "UNLOCKER_ERROR",
-        `The page needs the unblocking service (${escalation}), but it isn't configured on this server. Tell the user the page can't be fetched until a Bright Data key and zone are set up.`,
-      );
-    }
-    const unlock = (render: boolean) => fetchUnlocker(url, { apiKey, zone, render, deadline });
-    const render = escalation === "js_shell";
-    fetched = await unlock(render);
-    // A forced or block-triggered fetch can still come back as a JS shell; one rendered retry fixes that.
-    if (!render && escalationReason(fetched) === "js_shell") fetched = await unlock(true);
-
-    const stillBlocked = escalationReason(fetched);
-    if (stillBlocked && stillBlocked !== "js_shell") {
-      throw new FetchError(
-        "BLOCKED_AFTER_UNLOCKER",
-        `The site still served a bot challenge (${stillBlocked}) through the unblocking service. Tell the user the page can't be fetched right now.`,
-      );
-    }
-  }
-  fetched = fetched!;
-
+  // Bright Data does the unblocking and decides when a page needs a browser to render.
+  const fetched = await fetchUnlocker(url, { apiKey, zone, deadline });
   if (fetched.status >= 400) {
-    throw new FetchError("HTTP_ERROR", `The site answered HTTP ${fetched.status}. Check that the URL is correct; don't retry the same URL.`);
+    throw new FetchError(
+      "HTTP_ERROR",
+      `The site answered HTTP ${fetched.status} through the unblocking service. Check that the URL is correct, then tell the user the page can't be fetched; don't retry the same URL.`,
+    );
+  }
+  const mime = fetched.contentType.split(";")[0]!.trim().toLowerCase();
+  if (mime === "application/pdf") throw pdfError();
+  if (!TEXT_TYPE.test(mime)) {
+    throw new FetchError(
+      "UNSUPPORTED_CONTENT_TYPE",
+      `The URL returned ${mime}, which this tool can't convert. It handles web pages, JSON and plain text.`,
+    );
   }
 
-  const page = await convert(fetched.body, fetched.contentType, fetched.finalUrl, args.extract_main_content);
-  const { text, truncated } = truncate(page.markdown, args.max_tokens);
+  const { text, truncated } = truncate(fetched.markdown, args.max_tokens);
   const tokens = approxTokens(text);
 
-  if (!args.include_frontmatter) return truncated ? `${text}\n\n[... truncated at ~${tokens} tokens]` : text;
+  if (!args.include_frontmatter)
+    return truncated ? `${text}\n\n[... truncated at ~${tokens} tokens]` : text;
   return (
     frontMatter({
       url: url.href,
-      final_url: fetched.finalUrl,
-      title: page.title,
-      description: page.description,
-      modified: page.modified,
       status_code: fetched.status,
-      fetched_via: escalation ? "unlocker" : "direct",
-      escalation_reason: escalation,
       truncated,
       approx_tokens: tokens,
     }) + text
   );
 }
 
-/** Why a response needs the Unlocker: `blocked:<marker>`, `js_shell`, or undefined if it is usable. */
-function escalationReason(fetched: Fetched): string | undefined {
-  if (kindOf(fetched.contentType, fetched.body) !== "html") {
-    const blocked = detectBlock(fetched.status, "");
-    return blocked && `blocked:${blocked}`;
+async function brightDataConfig(): Promise<{ apiKey: string; zone: string }> {
+  const notConfigured = new FetchError(
+    "UNLOCKER_ERROR",
+    "The unblocking service isn't configured on this server. Tell the user the page can't be fetched until a Bright Data key and zone are set up.",
+  );
+  try {
+    const [apiKey, zone] = await Promise.all([
+      getSecret(BRIGHTDATA_API_KEY_NAME),
+      getSecret(BRIGHTDATA_ZONE_NAME),
+    ]);
+    if (!apiKey || !zone) throw notConfigured;
+    return { apiKey, zone };
+  } catch (err) {
+    if (err instanceof ParameterNotFoundError) throw notConfigured;
+    throw err;
   }
-  const detection = detect(fetched.status, decode(fetched.body, fetched.contentType));
-  if (!detection) return undefined;
-  return "blocked" in detection ? `blocked:${detection.blocked}` : "js_shell";
 }
+
+const pdfError = () =>
+  new FetchError(
+    "UNSUPPORTED_CONTENT_TYPE",
+    "This is a PDF, which this tool can't read. Use the built-in web fetch, which reads PDFs directly; if that fails too, tell the user.",
+  );

@@ -28,7 +28,7 @@ export default $config({
       handler: "src/handler.handler",
       runtime: "nodejs24.x",
       memory: "1024 MB",
-      timeout: "90 seconds", // Room for a 15 s direct fetch plus an Unlocker call with one retry.
+      timeout: "90 seconds", // Room for an Unlocker call plus one retry on a 5xx.
       url: true,
       environment: {
         SSM_PREFIX: ssmPrefix,

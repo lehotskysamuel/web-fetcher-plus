@@ -1,125 +1,93 @@
-import { readFileSync } from "node:fs";
+import { ParameterNotFoundError } from "@aws-lambda-powertools/parameters/errors";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fetchDirect, type Fetched } from "../src/fetch/http.js";
 import { truncate } from "../src/fetch/output.js";
-import { fetchUnlocker } from "../src/fetch/unlocker.js";
+import { fetchUnlocker, type Fetched } from "../src/fetch/unlocker.js";
 import { fetchPage, type FetchPageArgs } from "../src/tools/fetchPage.js";
 import { getSecret } from "../src/utils/aws.js";
 
-vi.mock("../src/fetch/http.js", async (original) => ({
-  ...(await original()),
-  fetchDirect: vi.fn(),
-}));
 vi.mock("../src/fetch/unlocker.js", () => ({ fetchUnlocker: vi.fn() }));
 vi.mock("../src/utils/aws.js", () => ({ getSecret: vi.fn() }));
 
-const fixture = (name: string) =>
-  readFileSync(new URL(`./fixtures/${name}`, import.meta.url), "utf8");
 const secrets: Record<string, string> = {
   "brightdata-api-key": "key",
   "brightdata-zone": "zone",
 };
 const URL_ = "https://kitchen.example/guides/sourdough";
 
+// Shaped like Bright Data's Markdown: the page title first, navigation included.
+const ARTICLE = `A Practical Guide to Sourdough | Kitchen
+
+[Recipes](https://kitchen.example/recipes) [Guides](/guides)
+
+# A Practical Guide to Sourdough
+
+Sourdough bread needs only flour, water and salt, plus a healthy starter and patience.
+
+Bulk fermentation is where most of the flavour develops. Keep the dough warm and fold it every half hour.
+
+| Step | Time |
+| --- | --- |
+| Bulk | 4 h |
+| Proof | 12 h |
+
+Try [our rye variation](https://kitchen.example/recipes/rye) next.`;
+
+const CHALLENGE = `Just a moment...
+
+www.example.com
+
+## Verifying you are human. This may take a few seconds.
+
+www.example.com needs to review the security of your connection before proceeding.`;
+
 const page = (
-  html: string,
+  markdown: string,
   status = 200,
   contentType = "text/html; charset=utf-8",
-): Fetched => ({
-  finalUrl: URL_,
-  status,
-  contentType,
-  body: Buffer.from(html),
-});
+): Fetched => ({ status, contentType, markdown });
 
 const run = (args: Partial<FetchPageArgs> = {}) =>
   fetchPage({
     url: URL_,
     include_frontmatter: true,
-    extract_main_content: true,
     max_tokens: 20000,
-    force_unlocker: false,
     ...args,
   });
 
-const direct = vi.mocked(fetchDirect);
 const unlocker = vi.mocked(fetchUnlocker);
 const secret = vi.mocked(getSecret);
 
 beforeEach(() => {
   vi.resetAllMocks();
-  secret.mockImplementation(async (name) => secrets[name]);
+  secret.mockImplementation(async (name) => secrets[name]!);
 });
 
-describe("fetch_page", () => {
-  it("returns front matter and the main content as Markdown", async () => {
-    direct.mockResolvedValue(page(fixture("article.html")));
+describe("fetch_blocked_page", () => {
+  it("returns front matter and Bright Data's Markdown as-is", async () => {
+    unlocker.mockResolvedValue(page(ARTICLE));
     const out = await run();
 
-    expect(out).toMatch(
-      /^---\nurl: https:\/\/kitchen\.example\/guides\/sourdough\n/,
+    expect(out).toBe(
+      "---\nurl: https://kitchen.example/guides/sourdough\nstatus_code: 200\ntruncated: false\n" +
+        `approx_tokens: ${Math.ceil(ARTICLE.length / 4)}\n---\n` +
+        ARTICLE,
     );
-    expect(out).toContain("title: A Practical Guide to Sourdough\n");
-    // Quoted because the value contains ": ".
-    expect(out).toContain(
-      'description: "How to bake sourdough bread at home: starter, hydration, fermentation and baking."\n',
-    );
-    expect(out).toContain("modified: 2026-07-20T11:07:47+00:00\n");
-    expect(out).toContain(
-      "status_code: 200\nfetched_via: direct\ntruncated: false\n",
-    );
-    expect(out).not.toContain("escalation_reason");
-    expect(unlocker).not.toHaveBeenCalled();
-
-    expect(out).toContain(
-      "Bulk fermentation is where most of the flavour develops.",
-    );
-    expect(out).toContain(
-      "[our rye variation](https://kitchen.example/recipes/rye)",
-    );
-    expect(out).toContain(
-      "![A finished loaf](https://kitchen.example/images/loaf.jpg)",
-    );
-    expect(out).toMatch(/\| Step \| Time \|\n\| --- \| --- \|/);
-    for (const noise of [
-      "googletagmanager",
-      "gtag",
-      "Deutsch",
-      "Privacy Policy",
-      "Careers",
-      "facebook.com/tr",
-      "does not support the video",
-      "youtube",
-    ]) {
-      expect(out).not.toContain(noise);
-    }
-  });
-
-  it("keeps navigation and footer with extract_main_content: false", async () => {
-    direct.mockResolvedValue(page(fixture("article.html")));
-    const out = await run({ extract_main_content: false });
-    expect(out).toContain("Privacy Policy");
-    expect(out).toContain("Deutsch");
-    expect(out).not.toContain("googletagmanager");
+    expect(unlocker).toHaveBeenCalledOnce();
+    expect(unlocker.mock.calls[0]![0].href).toBe(URL_);
+    expect(unlocker.mock.calls[0]![1]).toMatchObject({
+      apiKey: "key",
+      zone: "zone",
+    });
   });
 
   it("omits front matter when asked", async () => {
-    direct.mockResolvedValue(page(fixture("article.html")));
-    const out = await run({ include_frontmatter: false });
-    expect(out).not.toContain("---\n");
-    expect(
-      out.startsWith("# A Practical Guide to Sourdough") ||
-        out.startsWith("Sourdough bread"),
-    ).toBe(true);
-    expect(out).not.toContain("[... truncated");
+    unlocker.mockResolvedValue(page(ARTICLE));
+    expect(await run({ include_frontmatter: false })).toBe(ARTICLE);
   });
 
   it("truncates and flags it, in both output modes", async () => {
-    const long = fixture("article.html").replace(
-      "</article>",
-      "<p>More notes on baking and timing.</p>".repeat(100) + "</article>",
-    );
-    direct.mockResolvedValue(page(long));
+    const long = ARTICLE + "\n\nMore notes on baking and timing.".repeat(100);
+    unlocker.mockResolvedValue(page(long));
     const withMeta = await run({ max_tokens: 500 });
     expect(withMeta).toContain("truncated: true\n");
     const body = withMeta.split("---\n")[2]!;
@@ -129,64 +97,58 @@ describe("fetch_page", () => {
     expect(bare).toMatch(/\n\n\[\.\.\. truncated at ~\d+ tokens\]$/);
   });
 
-  it("escalates a blocked page to the Unlocker without rendering", async () => {
-    direct.mockResolvedValue(page(fixture("cloudflare.html"), 403));
-    unlocker.mockResolvedValue(page(fixture("article.html")));
-    const out = await run();
+  it("returns JSON as-is", async () => {
+    unlocker.mockResolvedValue(page('{"a": 1}', 200, "application/json"));
+    expect(await run({ include_frontmatter: false })).toBe('{"a": 1}');
     expect(unlocker).toHaveBeenCalledOnce();
-    expect(unlocker.mock.calls[0]![1]).toMatchObject({
-      apiKey: "key",
-      zone: "zone",
-      render: false,
-    });
-    expect(out).toContain(
-      "fetched_via: unlocker\nescalation_reason: blocked:http_403\n",
-    );
   });
 
-  it("renders when the direct page is a JS shell", async () => {
-    direct.mockResolvedValue(page(fixture("react-shell.html")));
-    unlocker.mockResolvedValue(page(fixture("article.html")));
-    const out = await run();
-    expect(unlocker.mock.calls[0]![1]).toMatchObject({ render: true });
-    expect(out).toContain("escalation_reason: js_shell\n");
+  it("returns a challenge page as-is; Bright Data decides what is blocked", async () => {
+    unlocker.mockResolvedValue(page(CHALLENGE));
+    expect(await run({ include_frontmatter: false })).toBe(CHALLENGE);
   });
 
-  it("skips the direct request with force_unlocker", async () => {
-    unlocker.mockResolvedValue(page(fixture("article.html")));
-    const out = await run({ force_unlocker: true });
-    expect(direct).not.toHaveBeenCalled();
-    expect(out).toContain("fetched_via: unlocker\nescalation_reason: forced\n");
-  });
-
-  it("errors when the Unlocker still gets a challenge", async () => {
-    direct.mockResolvedValue(page(fixture("datadome.html")));
-    unlocker.mockResolvedValue(page(fixture("datadome.html")));
-    await expect(run()).rejects.toMatchObject({
-      code: "BLOCKED_AFTER_UNLOCKER",
-    });
-  });
-
-  it("explains when the Unlocker is needed but not configured", async () => {
-    direct.mockResolvedValue(page(fixture("cloudflare.html"), 403));
+  it("explains when Bright Data isn't configured, without a request", async () => {
     secret.mockResolvedValue("");
+    await expect(run()).rejects.toMatchObject({ code: "UNLOCKER_ERROR" });
+
+    secret.mockRejectedValue(new ParameterNotFoundError("missing"));
     await expect(run()).rejects.toMatchObject({ code: "UNLOCKER_ERROR" });
     expect(unlocker).not.toHaveBeenCalled();
   });
 
-  it("reports HTTP errors without escalating", async () => {
-    direct.mockResolvedValue(page("<h1>Not found</h1>", 404));
-    await expect(run()).rejects.toMatchObject({ code: "HTTP_ERROR" });
+  it("reports the site's error statuses, blocks included, without retrying", async () => {
+    for (const status of [403, 404, 503]) {
+      unlocker.mockResolvedValueOnce(page("Forbidden", status));
+      await expect(run()).rejects.toMatchObject({
+        code: "HTTP_ERROR",
+        message: expect.stringContaining(`HTTP ${status}`),
+      });
+    }
+    expect(unlocker).toHaveBeenCalledTimes(3);
+  });
+
+  it("refuses a .pdf URL before paying for a request", async () => {
+    await expect(
+      run({ url: "https://kitchen.example/menu.PDF" }),
+    ).rejects.toMatchObject({
+      code: "UNSUPPORTED_CONTENT_TYPE",
+      message: expect.stringContaining("built-in web fetch"),
+    });
+    expect(secret).not.toHaveBeenCalled();
     expect(unlocker).not.toHaveBeenCalled();
   });
 
-  it("returns JSON as-is and refuses binary types", async () => {
-    direct.mockResolvedValue(page('{"a": 1}', 200, "application/json"));
-    expect(await run({ include_frontmatter: false })).toBe('{"a": 1}');
+  it("refuses PDFs and other binary types by their Content-Type", async () => {
+    unlocker.mockResolvedValue(
+      page("%PDF-1.4 garbage", 200, "application/pdf; qs=0.001"),
+    );
+    await expect(run()).rejects.toThrow(/This is a PDF/);
 
-    direct.mockResolvedValue(page("\x89PNG\r\n\x1a\n\0\0", 200, "image/png"));
+    unlocker.mockResolvedValue(page("\x89PNG", 200, "image/png"));
     await expect(run()).rejects.toMatchObject({
       code: "UNSUPPORTED_CONTENT_TYPE",
+      message: expect.stringContaining("image/png"),
     });
   });
 
@@ -197,7 +159,6 @@ describe("fetch_page", () => {
     await expect(
       run({ url: "https://example.com/?t=" + "a".repeat(80) }),
     ).rejects.toMatchObject({ code: "SUSPICIOUS_QUERY" });
-    expect(direct).not.toHaveBeenCalled();
     expect(unlocker).not.toHaveBeenCalled();
   });
 });

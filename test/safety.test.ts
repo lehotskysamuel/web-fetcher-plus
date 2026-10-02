@@ -1,18 +1,6 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { FetchError } from "../src/fetch/errors.js";
-import { checkHostResolves, checkUrl, DEFAULT_BLOCKED_DOMAINS, isPublicIp, suspiciousValue } from "../src/fetch/safety.js";
-
-vi.mock("node:dns/promises", () => ({
-  lookup: vi.fn(async (host: string) => {
-    const table: Record<string, string[]> = {
-      "rebind.example": ["93.184.215.14", "127.0.0.1"],
-      "public.example": ["93.184.215.14", "2606:2800:21f:cb07:6820:80da:af6b:8b2c"],
-      "v6private.example": ["fd00::1"],
-    };
-    if (!table[host]) throw Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" });
-    return table[host].map((address) => ({ address, family: address.includes(":") ? 6 : 4 }));
-  }),
-}));
+import { checkUrl, DEFAULT_BLOCKED_DOMAINS, isPublicIp, suspiciousValue } from "../src/fetch/safety.js";
 
 const code = (fn: () => unknown) => {
   try {
@@ -23,8 +11,6 @@ const code = (fn: () => unknown) => {
   return "OK";
 };
 const check = (url: string) => code(() => checkUrl(url, DEFAULT_BLOCKED_DOMAINS));
-
-afterEach(() => vi.clearAllMocks());
 
 describe("SSRF", () => {
   it.each([
@@ -58,12 +44,6 @@ describe("SSRF", () => {
     expect(check("http://[2606:4700::6810:84e5]/")).toBe("OK");
     expect(isPublicIp("8.8.8.8")).toBe(true);
     expect(isPublicIp("::ffff:8.8.8.8")).toBe(true);
-  });
-
-  it("refuses hosts that resolve to any private address", async () => {
-    await expect(checkHostResolves(new URL("https://rebind.example/"))).rejects.toMatchObject({ code: "SSRF_BLOCKED" });
-    await expect(checkHostResolves(new URL("https://v6private.example/"))).rejects.toMatchObject({ code: "SSRF_BLOCKED" });
-    await expect(checkHostResolves(new URL("https://public.example/"))).resolves.toBeUndefined();
   });
 
   it("rejects non-http schemes and junk", () => {
@@ -105,9 +85,5 @@ describe("query guard", () => {
 
   it("checks keys too", () => {
     expect(check(`https://example.com/?${"k".repeat(70)}=1`)).toBe("SUSPICIOUS_QUERY");
-  });
-
-  it("can be skipped for server-issued redirects", () => {
-    expect(code(() => checkUrl(`https://example.com/?t=${"a".repeat(80)}`, [], { checkQuery: false }))).toBe("OK");
   });
 });

@@ -1,28 +1,28 @@
 import { fetch } from "undici";
 import { FetchError } from "./errors.js";
-import type { Fetched } from "./http.js";
 
 const ENDPOINT = "https://api.brightdata.com/request";
 const MAX_ATTEMPT_MS = 70_000;
 const MIN_RETRY_MS = 5_000;
+export const MAX_BYTES = 15 * 1024 * 1024;
+
+export interface Fetched {
+  status: number;
+  /** The site's Content-Type, which describes what Bright Data converted, not the Markdown. */
+  contentType: string;
+  markdown: string;
+}
 
 export interface UnlockerOptions {
   apiKey: string;
   zone: string;
-  render: boolean;
   /** Epoch ms by which the call must be finished, retries included. */
   deadline: number;
 }
 
-interface UnlockerResponse {
-  status_code: number;
-  headers?: Record<string, string>;
-  body: string;
-}
-
 class Retryable extends Error {}
 
-/** Fetches through Bright Data Web Unlocker. One retry on network or 5xx errors, none on 4xx. */
+/** Fetches a page as Markdown through Bright Data Web Unlocker. One retry on network or 5xx errors, none on 4xx. */
 export async function fetchUnlocker(url: URL, opts: UnlockerOptions): Promise<Fetched> {
   try {
     return await attempt(url, opts);
@@ -36,47 +36,68 @@ export async function fetchUnlocker(url: URL, opts: UnlockerOptions): Promise<Fe
   }
 }
 
-async function attempt(url: URL, { apiKey, zone, render, deadline }: UnlockerOptions): Promise<Fetched> {
+// `format: "raw"` returns Bright Data's Markdown as the body with the site's headers, and the site's status in
+// `x-brd-status-code`. A response without that header is Bright Data's own.
+async function attempt(url: URL, { apiKey, zone, deadline }: UnlockerOptions): Promise<Fetched> {
   const timeout = Math.min(MAX_ATTEMPT_MS, deadline - Date.now());
   if (timeout <= 0) throw new FetchError("TIMEOUT", "Ran out of time before the unblocking service answered. Try again later.");
+  const signal = AbortSignal.timeout(timeout);
 
   let res;
   try {
     res = await fetch(ENDPOINT, {
       method: "POST",
       headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
-      body: JSON.stringify({ zone, url: url.href, format: "json", ...(render && { render: "true" }) }),
-      signal: AbortSignal.timeout(timeout),
+      body: JSON.stringify({ zone, url: url.href, format: "raw", data_format: "markdown" }),
+      signal,
     });
   } catch (err) {
-    if ((err as Error)?.name === "TimeoutError") {
-      throw new FetchError("TIMEOUT", "The unblocking service didn't answer in time. Try again later.");
-    }
-    throw new Retryable(`network error: ${(err as { cause?: { code?: string } })?.cause?.code ?? "unknown"}`);
+    throw networkError(err);
   }
 
-  if (!res.ok) {
+  const siteStatus = Number(res.headers.get("x-brd-status-code")) || undefined;
+  if (!siteStatus && !res.ok) {
     const detail = res.headers.get("x-brd-error") ?? (await res.text().catch(() => "")).slice(0, 200);
     const message = `HTTP ${res.status}${detail ? `: ${detail.replace(/\s+/g, " ")}` : ""}`;
     if (res.status >= 500) throw new Retryable(message);
     throw new FetchError("UNLOCKER_ERROR", `The unblocking service rejected the request (${message}). Tell the user; the server's Bright Data configuration may need fixing.`);
   }
 
-  let data: UnlockerResponse;
-  try {
-    data = (await res.json()) as UnlockerResponse;
-  } catch {
-    throw new Retryable("invalid JSON response");
+  if (Number(res.headers.get("content-length")) > MAX_BYTES) {
+    await res.body?.cancel();
+    throw tooLarge();
   }
-  if (typeof data?.status_code !== "number" || typeof data.body !== "string") throw new Retryable("unexpected response shape");
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for await (const chunk of res.body ?? []) {
+      size += chunk.byteLength;
+      if (size > MAX_BYTES) {
+        await res.body?.cancel();
+        throw tooLarge();
+      }
+      chunks.push(chunk);
+    }
+  } catch (err) {
+    if (err instanceof FetchError) throw err;
+    throw networkError(err);
+  }
 
-  const headers = Object.fromEntries(Object.entries(data.headers ?? {}).map(([k, v]) => [k.toLowerCase(), String(v)]));
   return {
-    finalUrl: url.href,
-    status: data.status_code,
-    contentType: headers["content-type"] ?? "",
-    body: Buffer.from(data.body, "utf8"),
+    status: siteStatus ?? res.status,
+    contentType: res.headers.get("content-type") ?? "",
+    markdown: Buffer.concat(chunks).toString("utf8"),
   };
+}
+
+const tooLarge = () =>
+  new FetchError("TOO_LARGE", `The response is larger than ${MAX_BYTES / 1024 / 1024} MB. This tool can't fetch files this big.`);
+
+function networkError(err: unknown): Error {
+  if ((err as Error)?.name === "TimeoutError") {
+    return new FetchError("TIMEOUT", "The unblocking service didn't answer in time. Try again later.");
+  }
+  return new Retryable(`network error: ${(err as { cause?: { code?: string } })?.cause?.code ?? "unknown"}`);
 }
 
 function toFetchError(err: unknown): FetchError {
