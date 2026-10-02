@@ -1,6 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import type { Config } from "../config.js";
 import { convert, decode, kindOf } from "../fetch/convert.js";
 import { detect, detectBlock } from "../fetch/detect.js";
 import { FetchError } from "../fetch/errors.js";
@@ -8,6 +7,10 @@ import { DirectNetworkBlock, fetchDirect, type Fetched } from "../fetch/http.js"
 import { approxTokens, frontMatter, truncate } from "../fetch/output.js";
 import { checkUrl, DEFAULT_BLOCKED_DOMAINS } from "../fetch/safety.js";
 import { fetchUnlocker } from "../fetch/unlocker.js";
+import { getSecret } from "../utils/aws.js";
+
+const BRIGHTDATA_API_KEY_NAME = "brightdata-api-key";
+const BRIGHTDATA_ZONE_NAME = "brightdata-zone";
 
 const DESCRIPTION = `Fetch a public web page. Use when the built-in web fetch fails, returns a CAPTCHA/access-denied page, or an empty JavaScript shell. Tries a direct request first and escalates to a paid unblocking service only when needed, so don't refetch the same URL without reason.
 
@@ -35,7 +38,7 @@ export function blockedDomains(): string[] {
     .filter(Boolean);
 }
 
-export function registerFetchPage(server: McpServer, config: Config) {
+export function registerFetchPage(server: McpServer) {
   server.registerTool(
     "fetch_page",
     {
@@ -67,7 +70,7 @@ export function registerFetchPage(server: McpServer, config: Config) {
     },
     async (args) => {
       try {
-        return { content: [{ type: "text", text: await fetchPage(args, config) }] };
+        return { content: [{ type: "text", text: await fetchPage(args) }] };
       } catch (err) {
         if (!(err instanceof FetchError)) console.error("fetch_page failed", err);
         const error =
@@ -78,7 +81,7 @@ export function registerFetchPage(server: McpServer, config: Config) {
   );
 }
 
-export async function fetchPage(args: FetchPageArgs, config: Config): Promise<string> {
+export async function fetchPage(args: FetchPageArgs): Promise<string> {
   const deadline = Date.now() + BUDGET_MS;
   const domains = blockedDomains();
   const url = checkUrl(args.url, domains);
@@ -98,8 +101,15 @@ export async function fetchPage(args: FetchPageArgs, config: Config): Promise<st
   }
 
   if (escalation) {
-    const unlock = (render: boolean) =>
-      fetchUnlocker(url, { apiKey: config.brightdataApiKey, zone: config.brightdataZone, render, deadline });
+    // Optional: unset until Bright Data is configured, and only escalations need them.
+    const [apiKey, zone] = await Promise.all([getSecret(BRIGHTDATA_API_KEY_NAME), getSecret(BRIGHTDATA_ZONE_NAME)]);
+    if (!apiKey || !zone) {
+      throw new FetchError(
+        "UNLOCKER_ERROR",
+        `The page needs the unblocking service (${escalation}), but it isn't configured on this server. Tell the user the page can't be fetched until a Bright Data key and zone are set up.`,
+      );
+    }
+    const unlock = (render: boolean) => fetchUnlocker(url, { apiKey, zone, render, deadline });
     const render = escalation === "js_shell";
     fetched = await unlock(render);
     // A forced or block-triggered fetch can still come back as a JS shell; one rendered retry fixes that.
