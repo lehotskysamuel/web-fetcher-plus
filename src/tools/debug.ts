@@ -1,33 +1,34 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ParameterNotFoundError } from "@aws-lambda-powertools/parameters/errors";
-import { z } from "zod";
 import { getSecret } from "../utils/aws.js";
-import { BRIGHTDATA_API_KEY_NAME, BRIGHTDATA_ZONE_NAME } from "./fetchPage.js";
+import { BRIGHTDATA_API_KEY_NAME, BRIGHTDATA_ZONE_NAME } from "./fetchBlockedPage.js";
 
 const CHECKED_PARAMETERS = [BRIGHTDATA_API_KEY_NAME, BRIGHTDATA_ZONE_NAME];
 
-export function registerHello(server: McpServer) {
+export function registerDebug(server: McpServer) {
   server.registerTool(
-    "hello",
+    "debug",
     {
-      title: "Hello",
+      title: "Debug",
       description:
-        "Returns a greeting with the server time and region, and whether the Bright Data parameters can be read and decrypted (never their values). Use it to check that the connector works.",
-      inputSchema: { name: z.string().optional().describe("Who to greet") },
+        "Reports diagnostic information about this server: the server time and region, and whether the SSM parameters can be read and decrypted (never their values). Use it to check that the connector works and is configured.",
+      inputSchema: {},
       annotations: { readOnlyHint: true },
     },
-    async ({ name }) => ({
-      content: [{ type: "text", text: await hello(name) }],
+    async () => ({
+      content: [{ type: "text", text: await debug() }],
     }),
   );
 }
 
-export async function hello(name?: string): Promise<string> {
+export async function debug(): Promise<string> {
   const checks = await Promise.all(
-    CHECKED_PARAMETERS.map(async (param) => `- ${param}: ${await checkParameter(param)}`),
+    CHECKED_PARAMETERS.map(
+      async (param) => `- ${param}: ${await checkParameter(param)}`,
+    ),
   );
   return [
-    `Hello, ${name || "world"}! Server time: ${new Date().toLocaleTimeString()}, region: Ireland.`,
+    `Server time: ${new Date().toLocaleTimeString()}, region: Ireland.`,
     "",
     "Bright Data parameters:",
     ...checks,
@@ -47,6 +48,7 @@ export async function checkParameter(param: string): Promise<string> {
     return `unreadable (${cause?.name ?? (err as Error)?.name ?? "unknown error"})`;
   }
   if (!value) return "empty";
-  if (/\s/.test(value)) return "contains whitespace, check for a stray space or newline";
+  if (/\s/.test(value))
+    return "contains whitespace, check for a stray space or newline";
   return "ok";
 }

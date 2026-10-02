@@ -12,14 +12,13 @@
     "@aws-lambda-powertools/parameters": "^2.35.0",
     "@aws-sdk/client-ssm": "^3.1145.0",
     "@modelcontextprotocol/sdk": "^1.31.0",
-    "prettier": "^3.9.9",
     "sst": "4.17.1",
-    "undici": "^8.11.2",
     "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/aws-lambda": "8.10.164",
     "@types/node": "^24.19.1",
+    "prettier": "^3.9.9",
     "typescript": "^7.0.2",
     "vitest": "^5.0.3"
   },

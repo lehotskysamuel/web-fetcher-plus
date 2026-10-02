@@ -5,8 +5,8 @@ import type {
 import { createHash, timingSafeEqual } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { registerFetchPage } from "./tools/fetchPage.js";
-import { registerHello } from "./tools/hello.js";
+import { registerFetchBlockedPage } from "./tools/fetchBlockedPage.js";
+import { registerDebug } from "./tools/debug.js";
 import { apigwEventToRequest, getSecret, lambdaResponse } from "./utils/aws.js";
 
 const MCP_SECRET_NAME = "mcp-secret";
@@ -70,8 +70,8 @@ async function handleMcp(
 ): Promise<APIGatewayProxyStructuredResultV2> {
   // Stateless mode needs a fresh server and transport per request.
   const server = new McpServer({ name: "aikiddo-mcp", version: "0.1.0" });
-  registerHello(server);
-  registerFetchPage(server);
+  registerDebug(server);
+  registerFetchBlockedPage(server);
 
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined,

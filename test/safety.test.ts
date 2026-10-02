@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { FetchError } from "../src/fetch/errors.js";
-import { checkUrl, DEFAULT_BLOCKED_DOMAINS, isPublicIp, suspiciousValue } from "../src/fetch/safety.js";
+import {
+  checkUrl,
+  DEFAULT_BLOCKED_DOMAINS,
+  isPublicIp,
+} from "../src/fetch/safety.js";
 
 const code = (fn: () => unknown) => {
   try {
@@ -10,9 +14,10 @@ const code = (fn: () => unknown) => {
   }
   return "OK";
 };
-const check = (url: string) => code(() => checkUrl(url, DEFAULT_BLOCKED_DOMAINS));
+const check = (url: string) =>
+  code(() => checkUrl(url, DEFAULT_BLOCKED_DOMAINS));
 
-describe("SSRF", () => {
+describe("local and private hosts", () => {
   it.each([
     "http://169.254.169.254/latest/meta-data/",
     "http://2852039166/", // decimal 169.254.169.254
@@ -36,7 +41,7 @@ describe("SSRF", () => {
     "http://app.localhost/",
     "http://metadata.google.internal/",
   ])("blocks %s", (url) => {
-    expect(check(url)).toBe("SSRF_BLOCKED");
+    expect(check(url)).toBe("URL_NOT_ALLOWED");
   });
 
   it("allows public addresses", () => {
@@ -55,35 +60,19 @@ describe("SSRF", () => {
   });
 
   it("blocks configured domains and their subdomains", () => {
-    expect(check("https://www.facebook.com/page")).toBe("DOMAIN_BLOCKED");
-    expect(check("https://x.com/")).toBe("DOMAIN_BLOCKED");
-    expect(check("https://linkedin.com./in/someone")).toBe("DOMAIN_BLOCKED");
+    expect(check("https://www.facebook.com/page")).toBe("URL_NOT_ALLOWED");
+    expect(check("https://x.com/")).toBe("URL_NOT_ALLOWED");
+    expect(check("https://linkedin.com./in/someone")).toBe("URL_NOT_ALLOWED");
     expect(check("https://notx.com/")).toBe("OK");
   });
 });
 
-describe("query guard", () => {
-  it.each([
-    ["long value", "a".repeat(65)],
-    ["email", "jane.doe@example.com"],
-    ["JWT", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig"],
-    ["API key", "sk-proj-abc123"],
-    ["GitHub token", "ghp_abcdefABCDEF123456"],
-    ["hex blob", "deadbeef00112233aabb"],
-    ["base64 blob", "U2VjcmV0IGRhdGEgaGVyZQ1"],
-  ])("refuses a %s", (_, value) => {
-    expect(suspiciousValue(value)).toBeDefined();
-    expect(check(`https://example.com/?v=${encodeURIComponent(value)}`)).toBe("SUSPICIOUS_QUERY");
-  });
-
-  it.each(["hello world", "2", "en-US", "utm_source", "1234567890123456789", "sourdough-bread-recipe", "Q3_2026_report"])(
-    "allows %s",
-    (value) => {
-      expect(suspiciousValue(value)).toBeUndefined();
-    },
-  );
-
-  it("checks keys too", () => {
-    expect(check(`https://example.com/?${"k".repeat(70)}=1`)).toBe("SUSPICIOUS_QUERY");
+describe("query strings", () => {
+  it("are passed through, however long or token-like", () => {
+    expect(
+      check(
+        `https://shop.example/search?q=${"a".repeat(200)}&sig=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig`,
+      ),
+    ).toBe("OK");
   });
 });

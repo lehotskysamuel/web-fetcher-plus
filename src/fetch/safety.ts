@@ -71,8 +71,8 @@ export function hostOf(url: URL): string {
 }
 
 /**
- * Syntax, scheme, domain blocklist and query guard, before any paid request. Bright Data makes the request from its
- * own network, so local and private hosts are refused because they can't work, not to protect ours.
+ * Syntax, scheme, local hosts and the domain blocklist, before any paid request. Not a network defence: Bright Data
+ * fetches from its own network, so local and private hosts are refused only because they can't work.
  */
 export function checkUrl(input: string, blockedDomains: string[]): URL {
   let url: URL;
@@ -104,14 +104,14 @@ export function checkUrl(input: string, blockedDomains: string[]): URL {
     host.endsWith(".internal")
   ) {
     throw new FetchError(
-      "SSRF_BLOCKED",
+      "URL_NOT_ALLOWED",
       `${host} is a local or internal host. Only public web pages can be fetched.`,
     );
   }
   // The WHATWG parser already normalizes decimal, octal and hex IPv4 forms to dotted quads.
   if (isIP(host) && !isPublicIp(host)) {
     throw new FetchError(
-      "SSRF_BLOCKED",
+      "URL_NOT_ALLOWED",
       `${host} is a private or reserved address. Only public web pages can be fetched.`,
     );
   }
@@ -121,47 +121,10 @@ export function checkUrl(input: string, blockedDomains: string[]): URL {
   );
   if (domain) {
     throw new FetchError(
-      "DOMAIN_BLOCKED",
+      "URL_NOT_ALLOWED",
       `${domain} is on this server's blocklist. Tell the user this site can't be fetched with this tool.`,
     );
   }
 
-  for (const [key, value] of url.searchParams) {
-    const reason = suspiciousValue(value) ?? suspiciousValue(key);
-    if (reason) {
-      throw new FetchError(
-        "SUSPICIOUS_QUERY",
-        `The query string contains ${reason}. Fetch the URL exactly as the user gave it, or ask the user for the page.`,
-      );
-    }
-  }
   return url;
-}
-
-/** Why a query value looks like smuggled data, or undefined if it looks harmless. */
-export function suspiciousValue(value: string): string | undefined {
-  if (value.length > 64) return "a value longer than 64 characters";
-  if (/[^\s@]+@[^\s@]+\.[a-z]{2,}/i.test(value)) return "an email address";
-  if (/^eyJ[\w-]+\.[\w-]+/.test(value)) return "a token";
-  if (
-    /^(sk|pk|rk)[-_]|^(ghp|gho|ghs|github_pat|xox[abprs]|glpat)[-_]|^AKIA[0-9A-Z]{12}/.test(
-      value,
-    )
-  )
-    return "a token";
-  if (
-    /^[0-9a-f]{16,}$/i.test(value) &&
-    /[a-f]/i.test(value) &&
-    /\d/.test(value)
-  )
-    return "a hex blob";
-  if (
-    /^[A-Za-z0-9+/_-]{20,}={0,2}$/.test(value) &&
-    /\d/.test(value) &&
-    /[a-z]/.test(value) &&
-    /[A-Z]/.test(value)
-  ) {
-    return "a base64 blob";
-  }
-  return undefined;
 }

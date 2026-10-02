@@ -1,8 +1,11 @@
 import { ParameterNotFoundError } from "@aws-lambda-powertools/parameters/errors";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { truncate } from "../src/fetch/output.js";
+import { BOUNDARY_WINDOW, truncate } from "../src/fetch/output.js";
 import { fetchUnlocker, type Fetched } from "../src/fetch/unlocker.js";
-import { fetchPage, type FetchPageArgs } from "../src/tools/fetchPage.js";
+import {
+  fetchBlockedPage,
+  type FetchBlockedPageArgs,
+} from "../src/tools/fetchBlockedPage.js";
 import { getSecret } from "../src/utils/aws.js";
 
 vi.mock("../src/fetch/unlocker.js", () => ({ fetchUnlocker: vi.fn() }));
@@ -44,10 +47,11 @@ const page = (
   markdown: string,
   status = 200,
   contentType = "text/html; charset=utf-8",
-): Fetched => ({ status, contentType, markdown });
+  complete = true,
+): Fetched => ({ status, contentType, markdown, complete });
 
-const run = (args: Partial<FetchPageArgs> = {}) =>
-  fetchPage({
+const run = (args: Partial<FetchBlockedPageArgs> = {}) =>
+  fetchBlockedPage({
     url: URL_,
     max_chars: 80000,
     ...args,
@@ -82,6 +86,13 @@ describe("fetch_blocked_page", () => {
     expect(note).toBe(`showing ${body!.length} of ${long.length} characters]`);
   });
 
+  it("says the page is longer when reading stopped at the memory cap", async () => {
+    unlocker.mockResolvedValue(page(ARTICLE, 200, "text/html", false));
+    expect(await run()).toBe(
+      `${ARTICLE}\n\n[... truncated: showing ${ARTICLE.length} characters; the page is longer]`,
+    );
+  });
+
   it("returns JSON as-is", async () => {
     unlocker.mockResolvedValue(page('{"a": 1}', 200, "application/json"));
     expect(await run()).toBe('{"a": 1}');
@@ -95,10 +106,10 @@ describe("fetch_blocked_page", () => {
 
   it("explains when Bright Data isn't configured, without a request", async () => {
     secret.mockResolvedValue("");
-    await expect(run()).rejects.toMatchObject({ code: "UNLOCKER_ERROR" });
+    await expect(run()).rejects.toMatchObject({ code: "INTERNAL_ERROR" });
 
     secret.mockRejectedValue(new ParameterNotFoundError("missing"));
-    await expect(run()).rejects.toMatchObject({ code: "UNLOCKER_ERROR" });
+    await expect(run()).rejects.toMatchObject({ code: "INTERNAL_ERROR" });
     expect(unlocker).not.toHaveBeenCalled();
   });
 
@@ -106,7 +117,7 @@ describe("fetch_blocked_page", () => {
     for (const status of [403, 404, 503]) {
       unlocker.mockResolvedValueOnce(page("Forbidden", status));
       await expect(run()).rejects.toMatchObject({
-        code: "HTTP_ERROR",
+        code: "URL_NOT_ACCESSIBLE",
         message: expect.stringContaining(`HTTP ${status}`),
       });
     }
@@ -137,30 +148,75 @@ describe("fetch_blocked_page", () => {
     });
   });
 
-  it("rejects unsafe URLs before any request", async () => {
+  it("rejects local hosts and blocklisted domains before any request", async () => {
     await expect(run({ url: "http://169.254.169.254/" })).rejects.toMatchObject(
-      { code: "SSRF_BLOCKED" },
+      { code: "URL_NOT_ALLOWED" },
     );
     await expect(
-      run({ url: "https://example.com/?t=" + "a".repeat(80) }),
-    ).rejects.toMatchObject({ code: "SUSPICIOUS_QUERY" });
+      run({ url: "https://www.linkedin.com/in/someone" }),
+    ).rejects.toMatchObject({ code: "URL_NOT_ALLOWED" });
     expect(unlocker).not.toHaveBeenCalled();
   });
 });
 
 describe("truncate", () => {
-  it("cuts at a paragraph boundary", () => {
-    const text = ["a".repeat(1500), "b".repeat(1500), "c".repeat(1500)].join(
-      "\n\n",
+  const LIMIT = 80_000;
+  // `x` filler with the given separators at the given positions.
+  const filler = (length: number, breaks: [number, string][]) => {
+    let text = "x".repeat(length);
+    for (const [at, sep] of breaks)
+      text = text.slice(0, at) + sep + text.slice(at + sep.length);
+    return text;
+  };
+
+  it("cuts at the last paragraph break within BOUNDARY_WINDOW of the limit", () => {
+    const at = LIMIT - BOUNDARY_WINDOW + 10;
+    const { text, truncated } = truncate(
+      filler(100_000, [[at, "\n\n"]]),
+      LIMIT,
     );
-    const { text: out, truncated } = truncate(text, 4000);
     expect(truncated).toBe(true);
-    expect(out).toBe(["a".repeat(1500), "b".repeat(1500)].join("\n\n"));
+    expect(text.length).toBe(at);
   });
 
-  it("hard-cuts when there is no boundary in the second half", () => {
-    const { text: out } = truncate("x".repeat(5000), 2000);
-    expect(out.length).toBe(2000);
+  it("falls back to a line break within twice BOUNDARY_WINDOW", () => {
+    const paragraphAt = LIMIT - 3 * BOUNDARY_WINDOW;
+    const lineAt = LIMIT - 2 * BOUNDARY_WINDOW + 10;
+    const text = filler(100_000, [
+      [paragraphAt, "\n\n"],
+      [lineAt, "\n"],
+    ]);
+    expect(truncate(text, LIMIT).text.length).toBe(lineAt);
+  });
+
+  it("hard-cuts at the limit when no boundary is close enough", () => {
+    const text = filler(100_000, [[LIMIT - 2 * BOUNDARY_WINDOW - 10, "\n\n"]]);
+    expect(truncate(text, LIMIT).text.length).toBe(LIMIT);
+    expect(truncate("x".repeat(5000), 2000).text.length).toBe(2000);
+  });
+
+  it("uses 25% and 50% of a limit under 20k characters", () => {
+    // 2000: paragraph from 1500, line from 1000.
+    expect(truncate(filler(5000, [[1600, "\n\n"]]), 2000).text.length).toBe(
+      1600,
+    );
+    // Paragraph at 1100 is outside its 25% window; the line break at 1200 is inside its 50% one.
+    const text = filler(5000, [
+      [1100, "\n\n"],
+      [1200, "\n"],
+    ]);
+    expect(truncate(text, 2000).text.length).toBe(1200);
+    expect(truncate(filler(5000, [[50, "\n\n"]]), 2000).text.length).toBe(2000);
+  });
+
+  it("never gives up more than half the limit between 20k and 80k", () => {
+    // 30000: paragraph from 22500, line from 15000.
+    expect(truncate(filler(50_000, [[5, "\n"]]), 30_000).text.length).toBe(
+      30_000,
+    );
+    expect(truncate(filler(50_000, [[16_000, "\n"]]), 30_000).text.length).toBe(
+      16_000,
+    );
   });
 
   it("leaves short text alone", () => {
